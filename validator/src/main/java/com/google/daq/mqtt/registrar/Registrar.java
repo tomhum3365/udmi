@@ -15,6 +15,7 @@ import static com.google.udmi.util.Common.SEC_TO_MS;
 import static com.google.udmi.util.Common.SITE_METADATA_KEY;
 import static com.google.udmi.util.Common.SUBFOLDER_PROPERTY_KEY;
 import static com.google.udmi.util.Common.SUBTYPE_PROPERTY_KEY;
+import static com.google.udmi.util.Common.TIMESTAMP_KEY;
 import static com.google.udmi.util.Common.UDMI_VERSION_KEY;
 import static com.google.udmi.util.GeneralUtils.CSV_JOINER;
 import static com.google.udmi.util.GeneralUtils.catchToNull;
@@ -35,6 +36,8 @@ import static com.google.udmi.util.GeneralUtils.setOrSize;
 import static com.google.udmi.util.GeneralUtils.writeString;
 import static com.google.udmi.util.JsonUtil.JSON_SUFFIX;
 import static com.google.udmi.util.JsonUtil.OBJECT_MAPPER;
+import static com.google.udmi.util.JsonUtil.asMap;
+import static com.google.udmi.util.JsonUtil.isoConvert;
 import static com.google.udmi.util.JsonUtil.loadFile;
 import static com.google.udmi.util.JsonUtil.loadFileRequired;
 import static com.google.udmi.util.JsonUtil.safeSleep;
@@ -65,6 +68,7 @@ import com.google.daq.mqtt.registrar.LocalDevice.DeviceKind;
 import com.google.daq.mqtt.util.CloudDeviceSettings;
 import com.google.daq.mqtt.util.CloudIotManager;
 import com.google.daq.mqtt.util.DeviceGatewayBoundException;
+import com.google.daq.mqtt.util.IotMockProvider.MockAction;
 import com.google.daq.mqtt.util.MessagePublisher.QuerySpeed;
 import com.google.daq.mqtt.util.PubSubPusher;
 import com.google.udmi.util.CommandLineOption;
@@ -154,12 +158,14 @@ public class Registrar {
       "bin/registrar site_spec [options] [devices...]");
   private final CommandLineProcessor commandLineProcessor = new CommandLineProcessor(this,
       usageForms);
+  private final AtomicInteger updatedDevices = new AtomicInteger();
   private CloudIotManager cloudIotManager;
   private File schemaBase;
   private PubSubPusher updatePusher;
   private PubSubPusher feedPusher;
   private Map<String, LocalDevice> allDevices;
   private Map<String, LocalDevice> workingDevices;
+  private Set<String> changedDevices;
   private Set<String> extraDevices;
   private String projectId;
   private boolean updateCloudIoT;
@@ -185,6 +191,9 @@ public class Registrar {
   private boolean doNotUpdate;
   private boolean expandDependencies;
   private boolean updateMetadata;
+  private String currentRunTimestamp;
+  private String lastRunTimestamp;
+  private boolean optimizeRun;
 
   /**
    * Main entry point for registrar.
@@ -234,7 +243,15 @@ public class Registrar {
     return UDMI_ROOT.getAbsolutePath();
   }
 
-  Registrar processArgs(List<String> argListRaw) {
+  /**
+   * process the arguments and create new SiteModel.
+   *
+   * <p/>argumentListRaw includes: site_path project_spec deviceList
+   *
+   * @param argListRaw raw list of arguments to process
+   * @return Registrar Instance
+   */
+  public Registrar processArgs(List<String> argListRaw) {
     List<String> argList = new ArrayList<>(argListRaw);
     if (argList.size() == 1 && new File(argList.get(0)).isDirectory()) {
       // Add implicit NO_SITE site spec for local-only site model processing.
@@ -254,6 +271,12 @@ public class Registrar {
     ifNotNullThen(remainingArgs, this::setDeviceList);
     requireNonNull(siteModel, "siteModel not defined");
     return this;
+  }
+
+  @CommandLineOption(short_form = "-o", arg_name = "optimize",
+      description = "Only process devices updated after the last run")
+  private void setOptimizeRun() {
+    this.optimizeRun = true;
   }
 
   @CommandLineOption(short_form = "-u", description = "Update metadata.json")
@@ -329,7 +352,12 @@ public class Registrar {
     }
   }
 
-  Registrar execute() {
+  /**
+   * runs the registrar.
+   *
+   * @return registrar instance
+   */
+  public Registrar execute() {
     execute(null);
     maybeProcessAltRegistry();
     return this;
@@ -351,7 +379,6 @@ public class Registrar {
       } else {
         processSiteMetadata();
         processAllDevices(modelMunger);
-        ifTrueThen(updateMetadata, this::updateDeviceMetadata);
       }
       writeErrors();
     } catch (ExceptionMap em) {
@@ -364,27 +391,32 @@ public class Registrar {
     }
   }
 
-  private void updateDeviceMetadata() {
+  private void loadSiteRegistrationTimestamps() {
+    currentRunTimestamp = isoConvert(Instant.now());
+
+    File registrationHistory = new File(siteDir, SiteModel.REGISTRATION_SUMMARY_BASE + ".json");
+    lastRunTimestamp = catchToNull(() -> asMap(registrationHistory).get(TIMESTAMP_KEY).toString());
+  }
+
+  private void updateDeviceMetadata(String deviceId) {
     checkNotNull(projectId, "can't update metadata: cloud project not defined");
-    AtomicInteger updatedCount = new AtomicInteger();
-    siteModel.forEachMetadata((deviceId, metadata) -> {
-      CloudModel registeredDevice = cloudIotManager.getRegisteredDevice(deviceId);
-      if (registeredDevice == null) {
-        return;
-      }
-      Metadata localMetadata = siteModel.getMetadata(deviceId);
-      if (localMetadata.cloud == null) {
-        localMetadata.cloud = new CloudModel();
-      }
-      String localId = localMetadata.cloud.num_id;
-      String registeredId = registeredDevice.num_id;
+
+    CloudModel registeredDevice = cloudModels.get(deviceId);
+    if (registeredDevice == null) {
+      return;
+    }
+    Metadata localMetadata = workingDevices.get(deviceId).getMetadata();
+    if (localMetadata.cloud == null) {
+      localMetadata.cloud = new CloudModel();
+    }
+    String registeredId = registeredDevice.num_id;
+    if (!Common.EMPTY_RETURN_RECEIPT.equals(registeredId)
+        && !registeredId.equals(localMetadata.cloud.num_id)) {
+      System.err.printf("Updating device %s num_id %s -> %s%n",
+          deviceId, localMetadata.cloud.num_id, registeredId);
       localMetadata.cloud.num_id = registeredId;
-      if (siteModel.updateMetadata(deviceId, localMetadata)) {
-        updatedCount.incrementAndGet();
-        System.err.printf("Updated num_id for %s: %s -> %s%n", deviceId, localId, registeredId);
-      }
-    });
-    System.err.printf("Updated %d device metadata files.%n", updatedCount.get());
+      updatedDevices.incrementAndGet();
+    }
   }
 
   private boolean isMockProject() {
@@ -483,6 +515,7 @@ public class Registrar {
     System.err.println("Out of " + workingDevices.size() + " total.");
     // WARNING! entries inserted into `errorSummary` ABOVE this comment must have a map value ^^^^^^
     errorSummary.put(CLOUD_VERSION_KEY, getCloudVersionInfo());
+    errorSummary.put(TIMESTAMP_KEY, currentRunTimestamp);
     lastErrorSummary = errorSummary;
     errorSummary.put(UDMI_VERSION_KEY, Common.getUdmiVersion());
     ifNotNullThen(siteModel.siteMetadataExceptionMap,
@@ -526,7 +559,7 @@ public class Registrar {
     if (!parentFile.isDirectory() && !parentFile.mkdirs()) {
       throw new IllegalStateException("Could not create directory " + parentFile.getAbsolutePath());
     }
-
+    loadSiteRegistrationTimestamps();
     summarizers.addAll(SUMMARIZERS.entrySet().stream().map(factory -> {
       try {
         Summarizer summarizer = factory.getValue().getDeclaredConstructor().newInstance();
@@ -570,6 +603,7 @@ public class Registrar {
 
   private void processAllDevices(Runnable modelMunger) {
     allDevices = loadAllDevices();
+    changedDevices = loadChangedDevices();
     Set<String> explicitDevices = getExplicitDevices();
     try {
       workingDevices = instantiateExtras
@@ -612,11 +646,14 @@ public class Registrar {
         total += processDevices(targetDevices);
       }
 
+      System.err.printf("Updated %d device metadata files.%n", updatedDevices.get());
       System.err.printf("Finished processing %d/%d devices.%n", total, targetDevices.size());
 
       if (updateCloudIoT) {
         bindGatewayDevices(targetLocals);
       }
+
+      finalizeLocalDevices();
 
       if (cloudModels != null && !isTargeted && !instantiateExtras) {
         extraDevices = processExtraDevices(difference(cloudModels.keySet(), targetDevices));
@@ -638,6 +675,21 @@ public class Registrar {
       throw new RuntimeException("Not a valid directory: " + devicesDir.getAbsolutePath());
     }
     return loadDevices(SiteModel.listDevices(devicesDir));
+  }
+
+  private Set<String> loadChangedDevices() {
+    if (optimizeRun && lastRunTimestamp != null) {
+      System.err.println("Collecting devices changed after " + lastRunTimestamp);
+      return allDevices.entrySet().stream()
+          .filter(entry -> {
+            LocalDevice device = entry.getValue();
+            Metadata metadata = device.getMetadata();
+            return metadata == null || metadata.timestamp == null
+                || metadata.timestamp.toInstant().isAfter(Instant.parse(lastRunTimestamp));
+          })
+          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)).keySet();
+    }
+    return allDevices.keySet();
   }
 
   private int processDevices(Set<String> deviceSet) {
@@ -874,6 +926,7 @@ public class Registrar {
         System.err.printf("Processed %s (%d/%d) in %.03fs (%s)%n", localName, count, totalCount,
             seconds, created ? "add" : "update");
       }
+      ifTrueThen(updateMetadata, () -> updateDeviceMetadata(localName));
     } catch (Exception e) {
       System.err.printf("Error processing %s: %s%n", localDevice.getDeviceId(), e);
       localDevice.captureError(ExceptionCategory.registering, e);
@@ -953,6 +1006,9 @@ public class Registrar {
   }
 
   private Set<String> getExplicitDevices() {
+    if (deviceList == null && optimizeRun) {
+      return new HashSet<>(changedDevices);
+    }
     if (deviceList == null) {
       return null;
     }
@@ -1391,6 +1447,9 @@ public class Registrar {
     preprocessMetadata(workingDevices);
     expandDependencies(workingDevices);
     initializeSettings(workingDevices);
+  }
+
+  private void finalizeLocalDevices() {
     writeNormalized(workingDevices);
     previewModels(workingDevices);
     validateExpected(workingDevices);
@@ -1565,8 +1624,9 @@ public class Registrar {
     }
   }
 
-  public List<Object> getMockActions() {
-    return cloudIotManager.getMockActions();
+  @SuppressWarnings("unchecked")
+  public List<MockAction> getMockActions() {
+    return (List<MockAction>) (List<?>) cloudIotManager.getMockActions();
   }
 
   @CommandLineOption(short_form = "-a", arg_name = "alternate",

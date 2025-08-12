@@ -182,7 +182,16 @@ public class ConfigManager {
 
   private String getLocalnetAddr(String rawFamily) {
     String family = ofNullable(rawFamily).orElse(DEFAULT_FAMILY);
-    return catchToNull(() -> metadata.localnet.families.get(family).addr);
+    String addr = catchToNull(() -> metadata.localnet.families.get(family).addr);
+    ifNotNullThen(addr, a -> NAMED_FAMILIES.get(family).validateAddr(a));
+    return addr;
+  }
+
+  private String getLocalnetNetwork(String rawFamily) {
+    String family = ofNullable(rawFamily).orElse(DEFAULT_FAMILY);
+    String addr = catchToNull(() -> metadata.localnet.families.get(family).network);
+    ifNotNullThen(addr, a -> NAMED_FAMILIES.get(family).validateNetwork(addr));
+    return addr;
   }
 
   private PointsetConfig getDevicePointsetConfig() {
@@ -241,7 +250,8 @@ public class ConfigManager {
         format("both gateway.target.addr and localnet.families.%s.addr should not be defined",
             family));
     try {
-      NAMED_FAMILIES.get(family).validateRef(pointRef);
+      String fullRef = format("%s://%s/%s", family, localAddr, pointRef);
+      NAMED_FAMILIES.get(family).validateRef(fullRef);
     } catch (Exception e) {
       schemaViolationsMap.put(String.format("%s %s: %s", family, pointRef, getCurrentContext()),
           wrapExceptionWithContext(e, false));
@@ -257,6 +267,15 @@ public class ConfigManager {
     if (metadata.localnet == null) {
       return null;
     }
+
+    // Just get the addr and networks to validate that they're defined properly.
+    metadata.localnet.families.keySet().forEach(family -> {
+      checkState(NAMED_FAMILIES.containsKey(family),
+          "Protocol validation not supported for " + family);
+      getLocalnetAddr(family);
+      getLocalnetNetwork(family);
+    });
+
     LocalnetConfig localnetConfig = new LocalnetConfig();
     localnetConfig.families = new HashMap<>();
     metadata.localnet.families.keySet()
