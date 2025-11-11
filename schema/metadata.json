@@ -47,6 +47,9 @@
         "section": "system"
       }
     },
+    "externals": {
+      "$ref": "file:model_externals.json#"
+    },
     "gateway": {
       "$ref": "file:model_gateway.json#",
       "$presentation": {
@@ -82,5 +85,8 @@
         }
       }
     }
+  },
+  "policy": {
+      "$ref": "file:model_policy.json#"
   }
 }
